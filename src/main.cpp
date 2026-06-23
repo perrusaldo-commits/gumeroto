@@ -21,6 +21,9 @@ Sensor Conductividad/Temp:      Gravity: Analog EC + TEMP SEN0451
 #include <Arduino.h>
 #include <Preferences.h>
 #include <RadioLib.h>
+#include <DFRobot_ECPRO.h>      // Sensor SEN0451
+
+
 
 #define DEBUG Serial
 
@@ -104,12 +107,17 @@ float ph_vol7 = 2.5;
 // EC
 // -----------------------------------------------------------------------------
 float ec_k = 1.0;
+DFRobot_ECPRO ec;               
+DFRobot_ECPRO_PT1000 ecpt;      
 
 // -----------------------------------------------------------------------------
 // OD
 // -----------------------------------------------------------------------------
-float od_v1 = 1500;
-float od_t1 = 25;
+float od_v1 = 1500;                       // Voltaje (mV) en punto 1 (ej. agua a 25°C)
+float od_t1 = 25;                         // Temperatura en punto 1
+float od_v2 = 1300;                       // Voltaje (mV) en punto 2 (ej. agua a 15°C)
+float od_t2 = 15;                         // Temperatura en punto 2
+bool od_calibracionDosPuntos = false;     // Activar/desactivar
 
 constexpr uint16_t tablaOD[41] = {
  14460,14220,13820,13440,13090,12740,12420,12110,11810,11530,
@@ -156,8 +164,8 @@ float leerOD(float temp);
 float leerORP();
 void leerCalibraciones();
 void salvarCalibracionORP(float valor);
-void salvarCalibracionEC(float valor, float temp);
-void salvarCalibracionOD(float temp);
+void salvarCalibracionEC(float valorPatron, float temp);  // 1413 uS/cm 
+void salvarCalibracionOD(float temp, bool esPunto2 = false);
 void salvarCalibracionPh();
 void comandos();
 void imprimirMenu();
@@ -174,7 +182,7 @@ void setup() {
     pinMode(BOTON_USUARIO, INPUT_PULLUP);
     analogReadResolution(ADC_BITS);
     analogSetAttenuation(ADC_11db);
-    //leerCalibraciones();
+    leerCalibraciones();
 
     delay(2000);
     
@@ -473,22 +481,34 @@ float leerVoltaje(int pin){
 
 //----------------------------------------------------------------------------
 
-float leerTemp(){
-  float v = leerVoltaje(tempSensor.pin);
-  v = filtro(tempSensor, v);    // Filtrado recomendado para mejorar estabilidad de la lectura de temperatura, que suele ser más sensible a ruido y fluctuaciones. El filtro suaviza las variaciones rápidas y proporciona un valor más estable para los cálculos posteriores (pH, EC, OD). Dado que la temperatura afecta directamente a las otras mediciones, es crucial tener una lectura de temperatura lo más precisa y estable posible para compensar correctamente el pH y la conductividad.
-  if (v < 0.05 || v > 3.2) return 25.0; // Protección
+float leerTemp() {
+    // 1. Lectura y filtrado 
+    float v = leerVoltaje(tempSensor.pin);
+    v = filtro(tempSensor, v);
 
-  // --- Conversión empírica optimizada para ESP32 ---
-  // Ajustada a comportamiento del SEN0451
-  float temp = 0;
-  temp = 107.8 * v - 60.0;    // Región útil (~0.6V - 1.1V)
-  temp += -15.0 * (v - 0.8) * (v - 0.8);  // Corrección fina (curvatura real del PT1000 + electrónica)
+    // 2. Protección contra valores fuera de rango 
+    if (v < 0.05 || v > 3.2) {
+        DEBUG.println(F("ERROR: Voltaje de temperatura fuera de rango"));
+        return NAN;  // devuelve un error claro
+    }
 
-   DEBUG.print(F("Temp: "));
-   DEBUG.print(temp, 1);  
-   DEBUG.println(F(" °C"));
+    // 3. Conversión USANDO LA LIBRERÍA OFICIAL
+    
+    //float temp = ecpt.convVoltagetoTemperature_C(v * 1000.0); // La librería espera el voltaje en milivoltios
+    float temp = ecpt.convVoltagetoTemperature_C(v);            // La librería espera el voltaje en voltios
 
-  return temp;
+    // 4. Verificación de resultado físico (seguridad adicional)
+    if (temp < -40.0 || temp > 125.0) {
+        DEBUG.println(F("ERROR: Temperatura calculada fuera de rango físico"));
+        return NAN;
+    }
+
+    // 5. Debug (TU CÓDIGO)
+    DEBUG.print(F("Temp: "));
+    DEBUG.print(temp, 1);
+    DEBUG.println(F(" °C"));
+
+    return temp;
 }
 
 //----------------------------------------------------------------------------
@@ -510,8 +530,9 @@ float leerPH(float temp){
       return -1;
   }
   float f = filtro(phSensor, v);
+   float f_mV = f * 1000.0;       // convertir a milivoltios
 
-  float ph_raw = ph_slope * f + ph_offset;
+  float ph_raw = ph_slope * f_mV + ph_offset;
   float ph = compensarPH(ph_raw, temp);
 
   DEBUG.print(F("pH: "));
@@ -525,46 +546,65 @@ float leerPH(float temp){
 }
 
 // ************************************************************
-// EC
+// EC (usando librería DFRobot_ECPRO)
 // ************************************************************
-float ecRaw(float v){
-  return 133.42 * v * v * v - 255.86 * v * v + 857.39 * v;
-}
 
-float leerEC(float temp){
+float leerEC(float temp) {
+    // 1. Lectura y filtrado del voltaje
+    float v = leerVoltaje(ecSensor.pin);
+          v = filtro(ecSensor, v);
 
-  float v = leerVoltaje(ecSensor.pin);
-      if (v < 0.1 || v > 3.2) {
-      DEBUG.print(F(" ⚠️ ERROR sensor"));
-      DEBUG.println();
-      return -1;
-      }
-  float f = filtro(ecSensor, v);
-  float ec = ecRaw(f);
-  float tempCoef = 0.02;                    // Coeficiente de temperatura típico para agua (2% por °C)
-  ec = ec / (1 + tempCoef * (temp - 25));   // Compensación de temperatura para EC, ajustando el valor medido a lo que sería a 25°C.
-                                            // Esto es importante porque la conductividad del agua varía con la temperatura, y la mayoría de las tablas de conversión EC a TDS o ppm asumen una temperatura de referencia de 25°C.
-                                            // Al compensar el EC a esta temperatura, se obtiene una lectura más precisa y comparable, independientemente de las condiciones ambientales actuales.
-  ec *= ec_k;
+    // 2. Validación del voltaje
+    if (v < 0.1 || v > 3.2) {
+        DEBUG.println(F(" ⚠️ ERROR: Voltaje de EC fuera de rango"));
+        return NAN;
+    }
 
-  DEBUG.print(F("EC: "));
-  DEBUG.print(ec, 1);
-  DEBUG.print(F(" uS | T: "));
-  DEBUG.println(temp, 1);
+    // 3. Verificar que la temperatura es válida
+    if (isnan(temp)) {
+        DEBUG.println(F(" ⚠️ ERROR: Temperatura no válida para compensar EC"));
+        return NAN;
+    }
 
-  return ec;
+    // 4. Calcular EC usando la LIBRERÍA OFICIAL
+    float v_mV = v * 1000.0;
+    // float ecValue = ec.getEC_us_cm(v, temp);
+    float ecValue = ec.getEC_us_cm(v_mV, temp);
+
+    // 5. Validación del resultado
+    if (ecValue < 0 || ecValue > 500000) {
+        DEBUG.println(F(" ⚠️ ERROR: EC calculado fuera de rango"));
+        return NAN;
+    }
+
+    // 6. Debug
+    DEBUG.print(F("EC: "));
+    DEBUG.print(ecValue, 1);
+    DEBUG.print(F(" uS/cm | T: "));
+    DEBUG.println(temp, 1);
+
+    return ecValue;
 }
 
 
 // ************************************************************
 // OD
 // ************************************************************
-float calcDO(float mv, int t){
-  float vsat = od_v1 + 35 * t - od_t1 * 35;
-  if (vsat < 1) return 0;
-return (mv * tablaOD[t] / vsat) / 1000.0f;  // La tabla tablaOD está basada en mV, por eso se multiplica mv por 1000 para convertirlo a mV antes de usar la tabla. Esto asegura que el valor de voltaje se interprete correctamente en la función de cálculo de oxígeno disuelto, proporcionando una lectura precisa de DO en mg/L.
+float calcDO(float mv, int t) {
+    float vsat;
 
+    if (od_calibracionDosPuntos && od_v2 > 0 && od_t2 > 0) {
+        // Calibración de dos puntos (más precisa)
+        vsat = (t - od_t2) * (od_v1 - od_v2) / (od_t1 - od_t2) + od_v2;
+    } else {
+        // Calibración de un punto (tu sistema actual)
+        vsat = od_v1 + 35 * t - od_t1 * 35;
+    }
+
+    if (vsat < 1) return 0;
+    return (mv * tablaOD[t] / vsat) / 1000.0f; // Retorna en mg/L
 }
+
 
 float leerOD(float temp){
   float v = leerVoltaje(odSensor.pin);
@@ -635,6 +675,12 @@ void imprimirMenu(){
 // ************************************************************
 void salvarCalibracionORP(float valor){
   float v = filtro(orpSensor, leerVoltaje(orpSensor.pin)) * 1000;
+
+  if (!estable(orpSensor, 5.0)) {                                   // Ejemplo: umbral de 5 mV
+      DEBUG.println(F("⚠️ Lectura inestable para calibrar ORP"));
+      return;
+  }
+
   orp_offset = valor - v;
 
   backup.begin("orp", false);
@@ -646,35 +692,68 @@ void salvarCalibracionORP(float valor){
 
 //--------------------------------------------------------------------------------------------------
 
-void salvarCalibracionEC(float valor, float temp){            // valor = patrón
-  float v = filtro(ecSensor, leerVoltaje(ecSensor.pin));
-  float ec = ecRaw(v);
-  float ec25 = ec / (1 + 0.02 * (temp - 25));
-      if (ec25 < 0.001) {
-      DEBUG.println(F("❌ Error calibración EC (señal muy baja)"));
-    return;
+void salvarCalibracionEC(float valorPatron, float temp) {
+    
+    float v = filtro(ecSensor, leerVoltaje(ecSensor.pin));                    // 1. Lectura y filtrado del voltaje del EC v en voltios
+
+    if (v < 0.001) {                                                          // 2. Verificación de señal válida
+        DEBUG.println(F("❌ Error: Señal de EC muy baja para calibrar"));
+        return;
     }
-  ec_k = valor/ec25;
+    
+    if (isnan(temp)) {                                                        // 3. Verificar que la temperatura es válida (no NAN)
+        DEBUG.println(F("❌ Error: Temperatura no válida para calibrar EC"));
+        return;
+    }
 
-  backup.begin("ec", false);
-    backup.putFloat("k", ec_k);    // salvar calibración
-  backup.end();
+     // Convertir a milivoltios para la librería
+    float v_mV = v * 1000.0;
+    float nuevoK = ec.calibrate(v_mV, valorPatron);                           // 4. Calcular el factor K usando el MÉTODO DE LA LIBRERÍA
 
-  DEBUG.println(F("✅ EC calibrado"));
+    if (nuevoK < 0.5 || nuevoK > 1.5) {                                       // 5. Validación del factor K (debe estar cerca de 1.0)
+        DEBUG.print(F("❌ Error: Factor K fuera de rango ("));
+        DEBUG.print(nuevoK, 4);
+        DEBUG.println(F("). Verifica la solución patrón."));
+        return;
+    }
+ 
+    backup.begin("ec", false);                                                // 6. Guardar la calibración
+    backup.putFloat("k", nuevoK);    // Guardas el nuevo K calculado
+    backup.end();
+
+    ec.setCalibration(nuevoK);                                                // 7. Actualizar también el valor en la librería para uso inmediato
+
+    // 8. Mensaje de éxito
+    DEBUG.print(F("✅ EC calibrado correctamente"));
+    DEBUG.print(F(" - K = "));
+    DEBUG.println(nuevoK, 4);
 }
 
 //--------------------------------------------------------------------------------------------------
 
-void salvarCalibracionOD(float temp){                           // con agua saturada al 100%
-  od_v1 = filtro(odSensor, leerVoltaje(odSensor.pin)) * 1000;
-  od_t1 = temp;
+void salvarCalibracionOD(float temp, bool esPunto2) {
+  if (isnan(temp)) {
+        DEBUG.println(F("❌ Error: Temperatura no válida para calibrar OD"));
+        return;
+    }
 
-  backup.begin("od", false);
-    backup.putFloat("v1", od_v1);
-    backup.putFloat("t1", od_t1);
-  backup.end();
+    float v = filtro(odSensor, leerVoltaje(odSensor.pin)) * 1000.0f;
 
-  DEBUG.println(F("✅ OD calibrado"));
+    backup.begin("od", false);
+    if (esPunto2) {
+        od_v2 = v;
+        od_t2 = temp;
+        backup.putFloat("v2", od_v2);
+        backup.putFloat("t2", od_t2);
+        DEBUG.println(F("✅ OD punto 2 calibrado (temperatura baja)"));
+    } else {
+        od_v1 = v;
+        od_t1 = temp;
+        backup.putFloat("v1", od_v1);
+        backup.putFloat("t1", od_t1);
+        DEBUG.println(F("✅ OD punto 1 calibrado (temperatura alta)"));
+    }
+    backup.end();
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -682,8 +761,10 @@ void salvarCalibracionOD(float temp){                           // con agua satu
 void salvarCalibracionPh(){
 
   if(ph_vol4 != 0 && ph_vol7 != 0 && ph_vol4 != ph_vol7){
-    ph_slope = (4.0 - 7.0) / (ph_vol4 - ph_vol7);
-    ph_offset = 7.0 - ph_slope*ph_vol7;
+  float v4_mV = ph_vol4 * 1000.0;                           // convertir a mV
+  float v7_mV = ph_vol7 * 1000.0;
+    ph_slope = (4.0 - 7.0) / (v4_mV - v7_mV);
+    ph_offset = 7.0 - ph_slope * v7_mV;
 
     backup.begin("ph", false);               // Guardar calibración de pH (offset y slope)
     backup.putFloat("offset", ph_offset);
@@ -741,10 +822,17 @@ void comandos(){
   }
 
   // OD
-  else if(c=="od"){
-    float temp = leerTemp();      // un punto de calibración (es suficiente)
-    salvarCalibracionOD(temp);    // mantener el agua saturada al 100%
-  }
+   else if (c == "od") {
+        float temp = leerTemp();
+        salvarCalibracionOD(temp); // Llama a la versión de 1 punto
+    }
+    
+    // OD - Calibración de dos puntos (nuevo comando)
+    else if (c == "od2") {
+        float temp = leerTemp();
+        salvarCalibracionOD(temp, true); // Llama a la versión de 2 puntos (punto 2)
+        DEBUG.println(F("📌 Ahora calibra el punto 1 con 'od'"));
+    }
 
   else if(c=="help" || c=="?"){
   imprimirMenu();
@@ -763,10 +851,25 @@ void leerCalibraciones(){
     orp_offset = backup.getFloat("offset", 0.0);
   backup.end();
 
-  // EC
-  backup.begin("ec", true);                        // Leer calibración de EC (coeficiente k)
-    ec_k = backup.getFloat("k", 1.0);
-  backup.end();
+   // --- EC (usando la librería) ---
+    backup.begin("ec", true);
+    if (backup.isKey("k")) {
+        float kGuardado = backup.getFloat("k", 1.0);
+        backup.end();
+        
+        if (kGuardado >= 0.5 && kGuardado <= 1.5) {
+            ec.setCalibration(kGuardado);
+            DEBUG.print(F("Calibración EC cargada: K = "));
+            DEBUG.println(kGuardado, 4);
+        } else {
+            DEBUG.println(F("⚠️ Calibración EC fuera de rango, usando K=1.0"));
+            ec.setCalibration(1.0);
+        }
+    } else {
+        backup.end();
+        DEBUG.println(F("Sin calibración EC previa, usando K=1.0"));
+        ec.setCalibration(1.0);
+    }
 
   // pH
   backup.begin("ph", true);                        // Leer calibración de pH (offset y slope)
@@ -778,5 +881,16 @@ void leerCalibraciones(){
   backup.begin("od", true);                        // Leer calibración de OD (valores v1 y t1)
     od_v1 = backup.getFloat("v1", 1500);
     od_t1 = backup.getFloat("t1", 25);
+    od_v2 = backup.getFloat("v2", 0);   // Si no existe, será 0
+    od_t2 = backup.getFloat("t2", 0);
   backup.end();
+  if (od_v2 > 0 && od_t2 > 0) {
+        od_calibracionDosPuntos = true;
+        DEBUG.println(F("OD: calibración de dos puntos cargada"));
+    } else {
+        od_calibracionDosPuntos = false;
+        DEBUG.println(F("OD: calibración de un punto cargada"));
+    }
 }
+
+
