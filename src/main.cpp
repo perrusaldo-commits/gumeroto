@@ -76,8 +76,8 @@ struct AnalogSensor {
 // -----------------------------------------------------------------------------
 
 #define PIN_BATERIA A5
-constexpr float VOLTAJE_MINIMO_OPERACION = 3.2f;
-constexpr float VOLTAJE_CARGA_COMPLETA = 5.1f;  // 4.1f
+constexpr float VOLTAJE_MINIMO_OPERACION = 3.2f;// 3.3 casi vacía 
+constexpr float VOLTAJE_CARGA_COMPLETA = 5.1f;  // 4.2 completamente cargada
 constexpr float FACTOR_DIV = 2.0f;              // DIVISOR 470K + 470K
 constexpr uint32_t INTERVALOS[4] = {            // Intervalos en minutos según voltaje de batería
                                     5,          // Batería alta (> 4.0V)
@@ -129,7 +129,7 @@ constexpr uint16_t tablaOD[41] = {
 // -----------------------------------------------------------------------------
 // ORP
 // -----------------------------------------------------------------------------
-float orp_offset = 0;
+float orp_offset = 0.0f;
 
 // -----------------------------------------------------------------------------
 //    VARIABLES GLOBALES DE LA RADIO
@@ -182,7 +182,7 @@ void setup() {
     pinMode(BOTON_USUARIO, INPUT_PULLUP);
     analogReadResolution(ADC_BITS);
     analogSetAttenuation(ADC_11db);
-    leerCalibraciones();
+    leerCalibraciones();                    // Leer variables de calibración o sus valores por defecto
 
     delay(2000);
     
@@ -192,16 +192,14 @@ void setup() {
     // Mostrar causa de wake
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
             if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-                DEBUG.println("[WAKE] Timer");
+                DEBUG.println("[WAKE] Timer");                      // despertó por timer
             } else {
-                DEBUG.printf("[WAKE] Cold boot: %d\n", cause);
+                DEBUG.printf("[WAKE] Cold boot: %d\n", cause);      // otra causa
             }
     
-    // Inicializar radio y restaurar sesión
-    inicializarRadio();
+    inicializarRadio();                                             // Inicializar radio y restaurar sesión
     
-    // Verificar sesión
-    uint32_t devAddr = nodo.getDevAddr();
+    uint32_t devAddr = nodo.getDevAddr();                           // Verificar sesión
         if (devAddr == 0) {
             DEBUG.println("[ERROR] Sesión inválida");
             delay(1000);
@@ -218,8 +216,8 @@ void setup() {
 
 void loop() {
     
-    float vbat = leerBateria();                 // Leer batería
-    DEBUG.printf("🔋[BATERÍA] %.2f V\n", vbat); // mostrar tensión de la batería 
+    float vbat = leerBateria();                                     // Leer batería
+    DEBUG.printf("🔋[BATERÍA] %.2f V\n", vbat);                     // mostrar tensión de la batería 
     
 // Protección por batería baja
     if (!bateriaSaludable(vbat)) {
@@ -227,7 +225,7 @@ void loop() {
         radio.sleep();
         delay(50);
         esp_sleep_enable_timer_wakeup(3600ULL * 1000000ULL);
-        esp_deep_sleep_start();
+        esp_deep_sleep_start();                                     // dormir por una hora
     }
     
 // -----------------------------
@@ -274,11 +272,11 @@ uint32_t minutos_sleep = calcularIntervaloSueno(vbat);      // Calcular interval
 
 void inicializarRadio() {
     int state;
-    bool coldBoot = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED);
+    bool coldBoot = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED);   // detectar tipo de arranque
     
     // Reset en cold boot
     if (coldBoot) {
-        DEBUG.println("[RADIO] Cold boot - reset");
+        DEBUG.println("[RADIO] Cold boot - reset");     // primer arranque (en frío)
         pinMode(RADIO_RST, OUTPUT);
         digitalWrite(RADIO_RST, LOW);
         delay(20);
@@ -287,7 +285,8 @@ void inicializarRadio() {
     }
     
     // Inicializar radio
-    state = radio.begin();
+    state = radio.begin();      // configuración del hardware de la radio
+
     if (state != RADIOLIB_ERR_NONE) {
         DEBUG.printf("[RADIO] ❌ Init fallo: %d\n", state);
         ESP.restart();
@@ -381,7 +380,7 @@ float leerBateria() {
     float raw = suma / (float)N;
     float voltaje = (raw / (float)ADC_MAX) * 3.3 * FACTOR_DIV;
     
-    return constrain(voltaje, VOLTAJE_MINIMO_OPERACION, VOLTAJE_CARGA_COMPLETA);
+    return constrain(voltaje, VOLTAJE_MINIMO_OPERACION, VOLTAJE_CARGA_COMPLETA);    // en voltios
 }
 
 // -----------------------------------------------------------------------------
@@ -469,7 +468,7 @@ bool estable(AnalogSensor &s, float umbral) {
 // ************************************************************
 // UTILIDADES
 // ************************************************************
-float leerVoltaje(int pin){
+float leerVoltaje(int pin){       // en voltios
   float sum = 0;
   for(int i = 0; i < N; i++){     // Promediar varias lecturas para mayor estabilidad
     sum += analogRead(pin);       // Leer valor ADC del pin analógico N veces y acumularlo para luego promediar. Esto ayuda a reducir el ruido en la lectura, especialmente importante para sensores analógicos que pueden tener fluctuaciones momentáneas.
@@ -493,8 +492,6 @@ float leerTemp() {
     }
 
     // 3. Conversión USANDO LA LIBRERÍA OFICIAL
-    
-    //float temp = ecpt.convVoltagetoTemperature_C(v * 1000.0); // La librería espera el voltaje en milivoltios
     float temp = ecpt.convVoltagetoTemperature_C(v);            // La librería espera el voltaje en voltios
 
     // 4. Verificación de resultado físico (seguridad adicional)
@@ -503,7 +500,7 @@ float leerTemp() {
         return NAN;
     }
 
-    // 5. Debug (TU CÓDIGO)
+    // 5. Debug
     DEBUG.print(F("Temp: "));
     DEBUG.print(temp, 1);
     DEBUG.println(F(" °C"));
@@ -847,32 +844,32 @@ else{
 
 void leerCalibraciones(){
   // ORP
-  backup.begin("orp", true);                       // Leer calibración de ORP (offset)
+  backup.begin("orp", true);                       // Leer calibración de ORP (offset) sólo lectura
     orp_offset = backup.getFloat("offset", 0.0);
   backup.end();
 
-   // --- EC (usando la librería) ---
+  // --- EC (usando la librería) ---
     backup.begin("ec", true);
-    if (backup.isKey("k")) {
-        float kGuardado = backup.getFloat("k", 1.0);
-        backup.end();
-        
-        if (kGuardado >= 0.5 && kGuardado <= 1.5) {
-            ec.setCalibration(kGuardado);
-            DEBUG.print(F("Calibración EC cargada: K = "));
-            DEBUG.println(kGuardado, 4);
+        if (backup.isKey("k")) {                            // ¿Existe la clave "k"?
+            float kGuardado = backup.getFloat("k", 1.0);    // leer su valor
+            backup.end();
+            
+            if (kGuardado >= 0.5 && kGuardado <= 1.5) {     // validar rango aceptable etá entre 0.5 y 1.5
+                ec.setCalibration(kGuardado);               // usar ese valor
+                DEBUG.print(F("Calibración EC cargada: K = "));
+                DEBUG.println(kGuardado, 4);
+            } else {
+                DEBUG.println(F("⚠️ Calibración EC fuera de rango, usando K=1.0"));
+                ec.setCalibration(1.0);                     // usar valor por defecto
+            }
         } else {
-            DEBUG.println(F("⚠️ Calibración EC fuera de rango, usando K=1.0"));
+            backup.end();
+            DEBUG.println(F("Sin calibración EC previa, usando K=1.0"));
             ec.setCalibration(1.0);
-        }
-    } else {
-        backup.end();
-        DEBUG.println(F("Sin calibración EC previa, usando K=1.0"));
-        ec.setCalibration(1.0);
-    }
+            }
 
   // pH
-  backup.begin("ph", true);                        // Leer calibración de pH (offset y slope)
+  backup.begin("ph", true);                        // Leer calibración de pH (offset y pendiente)
     ph_offset = backup.getFloat("offset", 0.0);
     ph_slope  = backup.getFloat("slope", -5.7);
   backup.end();
@@ -881,9 +878,10 @@ void leerCalibraciones(){
   backup.begin("od", true);                        // Leer calibración de OD (valores v1 y t1)
     od_v1 = backup.getFloat("v1", 1500);
     od_t1 = backup.getFloat("t1", 25);
-    od_v2 = backup.getFloat("v2", 0);   // Si no existe, será 0
+    od_v2 = backup.getFloat("v2", 0); 
     od_t2 = backup.getFloat("t2", 0);
   backup.end();
+
   if (od_v2 > 0 && od_t2 > 0) {
         od_calibracionDosPuntos = true;
         DEBUG.println(F("OD: calibración de dos puntos cargada"));
